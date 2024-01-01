@@ -163,11 +163,6 @@ if __name__ == "__main__":
                     action=on_exit_tray)
             )
         )
-
-        # For platforms != macOS, display the tray icon now with non-blocking function
-        if platform.system() != "Darwin":
-            tray_icon.run_detached()
-            logger.info("Tray icon has been displayed")
     except:
         tray_icon = None
         logger.warning("Tray icon is not supported on your platform")

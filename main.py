@@ -19,17 +19,22 @@
 
 # This file is a simple Python test program using the library code to display custom content on screen (see README)
 
-import os
 import signal
 import time
-import sys
 from datetime import datetime
-import random
+from threading import Thread, Lock
 # Import only the modules for LCD communication
 
 from library.log import logger
-
+from PIL import Image
 from objects.screen import screen
+from objects.app import app
+from objects.bg_handler import background_handler
+
+try:
+    import pystray
+except:
+    pass
 
 import win32api
 import win32con
@@ -38,78 +43,153 @@ import win32gui
 stop = False
 drawing = True
 
-if __name__ == "__main__":
+def sighandler(signum, frame):
+    global stop
+    stop = True
 
-    index = 0
 
+def on_win32_ctrl_event(event):
+    """Handle Windows console control events (like Ctrl-C)."""
+    global stop
+    if event in (win32con.CTRL_C_EVENT, win32con.CTRL_BREAK_EVENT, win32con.CTRL_CLOSE_EVENT):
+        logger.debug("Caught Windows control event %s, exiting" % event)
+        stop = True
+    return 0
+
+
+def on_win32_wm_event(hWnd, msg, wParam, lParam):
+    global drawing
+    global stop
+    """Handle Windows window message events (like ENDSESSION, CLOSE, DESTROY)."""
+    logger.debug("Caught Windows window message event %s" % msg)
+    logger.debug("Info %s" % wParam)
+    if msg == win32con.WM_POWERBROADCAST:
+        # WM_POWERBROADCAST is used to detect computer going to/resuming from sleep
+        if wParam == win32con.PBT_APMSUSPEND:
+            logger.info("Computer is going to sleep, display will turn off")
+            drawing = False
+            time.sleep(1)
+        elif wParam == win32con.PBT_APMRESUMEAUTOMATIC:
+            logger.info("Computer is resuming from sleep, display will turn on")
+            drawing = True
+    else:
+        # For any other events, the program will stop
+        logger.info("Program will now exit")
+        stop = True
+    return 0
+
+
+def lcdThread(background_handler,mutex):
+    global drawing
+    global stop
     lcd = screen()
 
-    def sighandler(signum, frame):
-        global stop
-        stop = True
+    lcd.on()
 
-    # Set the signal handlers, to send a complete frame to the LCD before exit
+    # Display the current time and some progress bars as fast as possible
+    old_time = datetime.now()
 
+    text_x = 161
+    time_y = 30
+    date_y = 260
+    old_drawing = True
+    redraw = False
+    while not stop:
+        current_time = datetime.now()
+        difference = current_time - old_time
+        difference_in_seconds = difference.total_seconds()
 
-    def on_win32_ctrl_event(event):
-        """Handle Windows console control events (like Ctrl-C)."""
-        global stop
-        if event in (win32con.CTRL_C_EVENT, win32con.CTRL_BREAK_EVENT, win32con.CTRL_CLOSE_EVENT):
-            logger.debug("Caught Windows control event %s, exiting" % event)
-            stop = True
-        return 0
+        with mutex:
+            redraw = background_handler.check_redraw()
 
+        if(difference_in_seconds > 30 or redraw):
+            old_time = current_time
+            with mutex:
+                current_background = background_handler.get_current_item()
+                background_handler.clear_redraw()
+            lcd.setBackground(current_background)
+            temp = date_y
+            date_y = time_y
+            time_y = temp
+        
+        lcd.setTime(current_time.strftime('%H:%M'), text_x, time_y,
+                             font="roboto/Roboto-Bold.ttf",
+                             font_size=60,
+                             font_color=(255, 255, 255),
+                             align = 'center')
 
-    def on_win32_wm_event(hWnd, msg, wParam, lParam):
-        global drawing
-        """Handle Windows window message events (like ENDSESSION, CLOSE, DESTROY)."""
-        logger.debug("Caught Windows window message event %s" % msg)
-        logger.debug("Info %s" % wParam)
-        if msg == win32con.WM_POWERBROADCAST:
-            # WM_POWERBROADCAST is used to detect computer going to/resuming from sleep
-            if wParam == win32con.PBT_APMSUSPEND:
-                logger.info("Computer is going to sleep, display will turn off")
-                drawing = False
-                lcd.off()
-                time.sleep(1)
-            elif wParam == win32con.PBT_APMRESUMEAUTOMATIC:
-                logger.info("Computer is resuming from sleep, display will turn on")
+        lcd.setDate(datetime.now().strftime('%d/%m'), text_x, date_y,
+                    font="roboto/Roboto-Bold.ttf",
+                    font_size=60,
+                    font_color=(255, 255, 255),
+                    align = 'center')
+
+        if drawing:
+            if old_drawing != drawing:
+                logger.info("Turning Display on")
                 lcd.on()
-                drawing = True
+                old_drawing = drawing
+            lcd.draw()
         else:
-            # For any other events, the program will stop
-            logger.info("Program will now exit")
+            if old_drawing != drawing:
+                logger.info("Turning Display Off")
+                lcd.off()
+                old_drawing = drawing
+
+        
+        win32gui.PumpWaitingMessages()
+        time.sleep(0.02)
+
+    lcd.clean_stop()
+
+    time.sleep(1)
+    # Close serial connection at exit
+    lcd.close()
+
+if __name__ == "__main__":
+    # Define background picture
+    mutex = Lock()
+    bg_handler = background_handler()
+    bg_handler.load_backgrounds("res/backgrounds/FF14/")
+    gui = app(bg_handler,mutex)
+
+    def on_exit_tray(tray_icon, item):
+        global stop
+        global gui
+        logger.info("Exit from tray icon")
+        if tray_icon:
+            tray_icon.visible = False
             stop = True
-        return 0
+            time.sleep(1)
+            tray_icon.stop()
+            gui.stop_event()
+            logger.info("Exitting")
+
+    try:
+        tray_icon = pystray.Icon(
+            name='Keyboard Screen',
+            title='Keyboard Screen',
+            icon=Image.open("res/icons/monitor-icon-17865/64.png"),
+            menu=pystray.Menu(
+                pystray.MenuItem(
+                text='Open',
+                action=gui.resume_window_event),
+                pystray.Menu.SEPARATOR,
+                pystray.MenuItem(
+                    text='Exit',
+                    action=on_exit_tray)
+            )
+        )
+    except:
+        tray_icon = None
+        logger.warning("Tray icon is not supported on your platform")
+
 
     signal.signal(signal.SIGINT, sighandler)
     signal.signal(signal.SIGTERM, sighandler)
     win32api.SetConsoleCtrlHandler(on_win32_ctrl_event, True)
 
-    lcd.on()
-    # Define background picture
-    background_paths = []
-
-    for file in os.listdir("res/backgrounds/"):
-        background_paths.append("res/backgrounds/" + file)
-    #"res/backgrounds/backgroundff14.png"
-
-    current_background = background_paths[index]
-
-    lcd.setBackground(current_background)
-    lcd.setTime(datetime.now().strftime('%H:%M'), 161, 30,
-                            font="roboto/Roboto-Bold.ttf",
-                            font_size=60,
-                            font_color=(255, 255, 255),
-                            align = 'center')
-    lcd.setDate(datetime.now().strftime('%d/%m'), 161, 260,
-                        font="roboto/Roboto-Bold.ttf",
-                        font_size=60,
-                        font_color=(255, 255, 255),
-                        align = 'center')
-    lcd.draw()
-
-    # Display the current time and some progress bars as fast as possible
+    
 
     # Create a hidden window just to be able to receive window message events (for shutdown/logoff clean stop)
     hinst = win32api.GetModuleHandle(None)
@@ -142,34 +222,17 @@ if __name__ == "__main__":
     except Exception as e:
         logger.error("Exception while creating event window: %s" % str(e))
 
-    old_time = datetime.now()
-    current_index = 0
-    while not stop:
-        current_time = datetime.now()
-        difference = current_time - old_time
-        difference_in_seconds = difference.total_seconds()
 
-        if(difference_in_seconds > 30):
-            index = index + 1
-            if not (index < len(background_paths)):
-                index = 0
-            old_time = current_time
-            current_background = background_paths[index]
-            lcd.setBackground(current_background)
-        
-        lcd.setTime(current_time.strftime('%H:%M'), 161, 30,
-                             font="roboto/Roboto-Bold.ttf",
-                             font_size=60,
-                             font_color=(255, 255, 255),
-                             align = 'center')
+    t1 = Thread(target=lcdThread, args=(bg_handler,mutex,))
+    t1.start()
 
-        if drawing:
-            lcd.draw()
-        win32gui.PumpWaitingMessages()
-        time.sleep(0.5)
+    t2 = Thread(target=tray_icon.run)
+    t2.start()
 
-    lcd.clean_stop()
+    gui.run()
 
-    time.sleep(5)
-    # Close serial connection at exit
-    lcd.close()
+    logger.debug("Program End")
+
+
+
+
