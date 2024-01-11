@@ -23,6 +23,7 @@ import signal
 import time
 from datetime import datetime
 from threading import Thread, Lock
+import queue
 # Import only the modules for LCD communication
 
 from library.log import logger
@@ -40,26 +41,26 @@ import win32api
 import win32con
 import win32gui
 
-stop = False
-drawing = True
+message_queue = queue.Queue()
 
 def sighandler(signum, frame):
-    global stop
-    stop = True
+    global message_queue
+    item = (True,False)
+    message_queue.put(item)
 
 
 def on_win32_ctrl_event(event):
     """Handle Windows console control events (like Ctrl-C)."""
-    global stop
+    global message_queue
     if event in (win32con.CTRL_C_EVENT, win32con.CTRL_BREAK_EVENT, win32con.CTRL_CLOSE_EVENT):
         logger.debug("Caught Windows control event %s, exiting" % event)
-        stop = True
+        item = (True,False)
+        message_queue.put(item)
     return 0
 
 
 def on_win32_wm_event(hWnd, msg, wParam, lParam):
-    global drawing
-    global stop
+    global message_queue
     """Handle Windows window message events (like ENDSESSION, CLOSE, DESTROY)."""
     logger.debug("Caught Windows window message event %s" % msg)
     logger.debug("Info %s" % wParam)
@@ -67,21 +68,23 @@ def on_win32_wm_event(hWnd, msg, wParam, lParam):
         # WM_POWERBROADCAST is used to detect computer going to/resuming from sleep
         if wParam == win32con.PBT_APMSUSPEND:
             logger.info("Computer is going to sleep, display will turn off")
-            drawing = False
+            item = (False,False)
+            message_queue.put(item)
             time.sleep(1)
         elif wParam == win32con.PBT_APMRESUMEAUTOMATIC:
             logger.info("Computer is resuming from sleep, display will turn on")
-            drawing = True
+            item = (False,True)
+            message_queue.put(item)
     else:
         # For any other events, the program will stop
         logger.info("Program will now exit")
-        stop = True
+        item = (True,False)
+        message_queue.put(item)
+        time.sleep(1)
     return 0
 
 
-def lcdThread(background_handler,mutex):
-    global drawing
-    global stop
+def lcdThread(background_handler,queue,mutex):
     lcd = screen()
 
     lcd.on()
@@ -93,8 +96,16 @@ def lcdThread(background_handler,mutex):
     time_y = 30
     date_y = 260
     old_drawing = True
+    drawing = True
+    stop = False
     redraw = False
     while not stop:
+
+        if not queue.empty():
+            item = queue.get()
+            stop = item[0]
+            drawing = item[1]
+
         current_time = datetime.now()
         difference = current_time - old_time
         difference_in_seconds = difference.total_seconds()
@@ -151,15 +162,16 @@ if __name__ == "__main__":
     mutex = Lock()
     bg_handler = background_handler()
     bg_handler.load_backgrounds("res/backgrounds/FF14/")
-    gui = app(bg_handler,mutex)
+    gui = app(bg_handler,message_queue, mutex)
 
     def on_exit_tray(tray_icon, item):
-        global stop
+        global message_queue
         global gui
         logger.info("Exit from tray icon")
         if tray_icon:
             tray_icon.visible = False
-            stop = True
+            item = (True,False)
+            message_queue.put(item)
             time.sleep(1)
             tray_icon.stop()
             gui.stop_event()
@@ -223,7 +235,7 @@ if __name__ == "__main__":
         logger.error("Exception while creating event window: %s" % str(e))
 
 
-    t1 = Thread(target=lcdThread, args=(bg_handler,mutex,))
+    t1 = Thread(target=lcdThread, args=(bg_handler,message_queue,mutex,))
     t1.start()
 
     t2 = Thread(target=tray_icon.run)
